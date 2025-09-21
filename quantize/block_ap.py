@@ -13,6 +13,7 @@ from quantize.utils import (
     quant_parameters,weight_parameters,trainable_parameters,
     set_quant_state,quant_inplace,set_quant_parameters,
     set_weight_parameters,trainable_parameters_num,get_named_linears,set_op_by_name)
+from quantize.sensitivity_analysis import compute_layer_sensitivity, rank_layers_by_sensitivity, analyze_sensitivity_patterns
 import time
 from datautils_block import BlockTrainDataset
 from torch.utils.data import DataLoader
@@ -156,10 +157,62 @@ def block_ap(
         for index,data in enumerate(fp_val_inps):
             quant_val_inps.update_data(index, data)
 
-    # step 6: start training    
+    # step 6: determine layer training order based on sensitivity
+    if args.layer_ordering == 'sensitivity':
+        logger.info("Computing layer sensitivity scores...")
+        start_time = time.time()
+        
+        try:
+            # Use a subset of training data for sensitivity computation
+            sensitivity_dataloader = [trainloader[i] for i in range(min(args.sensitivity_samples, len(trainloader)))]
+            
+            # Temporarily move model to GPU for sensitivity computation
+            model.to(dev)
+            sensitivity_scores = compute_layer_sensitivity(
+                model, sensitivity_dataloader, 
+                metric=args.sensitivity_metric,
+                max_samples=args.sensitivity_samples
+            )
+            
+            # Validate sensitivity scores
+            if len(sensitivity_scores) != len(layers):
+                logger.warning(f"Sensitivity scores length mismatch: {len(sensitivity_scores)} vs {len(layers)}")
+                raise ValueError("Sensitivity computation failed")
+            
+            # Analyze sensitivity patterns
+            sensitivity_analysis = analyze_sensitivity_patterns(sensitivity_scores)
+            logger.info(f"Sensitivity analysis: {sensitivity_analysis}")
+            
+            # Get layer training order (most sensitive first)
+            layer_indices = rank_layers_by_sensitivity(sensitivity_scores, order='descending')
+            
+            logger.info(f"Layer sensitivity scores: {[f'{s:.4f}' for s in sensitivity_scores.tolist()]}")
+            logger.info(f"Layer training order: {layer_indices}")
+            logger.info(f"Sensitivity computation time: {time.time() - start_time:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Sensitivity computation failed: {e}")
+            logger.info("Falling back to original layer ordering")
+            layer_indices = list(range(len(layers)))
+            sensitivity_scores = torch.ones(len(layers))  # Default scores for adaptive LR
+        
+        # Move model back to CPU
+        model.cpu()
+        torch.cuda.empty_cache()
+        
+    elif args.layer_ordering == 'random':
+        layer_indices = torch.randperm(len(layers)).tolist()
+        sensitivity_scores = torch.ones(len(layers))  # Default scores
+        logger.info(f"Random layer training order: {layer_indices}")
+    else:
+        layer_indices = list(range(len(layers)))
+        sensitivity_scores = torch.ones(len(layers))  # Default scores
+        logger.info("Using original layer training order")
+    
+    # step 7: start training with determined order
     loss_func = torch.nn.MSELoss()
-    for block_index in range(len(layers)):
-        logger.info(f"=== Start quantize blocks {block_index}===")
+    for i, block_index in enumerate(layer_indices):
+        logger.info(f"=== Start quantize block {block_index} (training order: {i+1}/{len(layers)}) ===")
         # step 6.1: replace torch.nn.Linear with QuantLinear for QAT
         layer = layers[block_index].to(dev)
         qlayer = copy.deepcopy(layer)
@@ -199,9 +252,10 @@ def block_ap(
                 
             if args.weight_lr > 0:
                 set_weight_parameters(qlayer,True)
-                param.append({"params":weight_parameters(qlayer),"lr":args.weight_lr})
-                empty_optimizer_2 = torch.optim.AdamW([torch.tensor(0)], lr=args.weight_lr)
-                weight_scheduler = CosineAnnealingLR(empty_optimizer_2, T_max=total_training_iteration, eta_min=args.weight_lr/args.min_lr_factor)
+                scaled_weight_lr = args.weight_lr * normalized_sensitivity
+                param.append({"params":weight_parameters(qlayer),"lr":scaled_weight_lr})
+                empty_optimizer_2 = torch.optim.AdamW([torch.tensor(0)], lr=scaled_weight_lr)
+                weight_scheduler = CosineAnnealingLR(empty_optimizer_2, T_max=total_training_iteration, eta_min=scaled_weight_lr/args.min_lr_factor)
                 weight_index = param_group_index
                 param_group_index += 1
             else:

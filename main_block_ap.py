@@ -94,6 +94,20 @@ def main():
     parser.add_argument("--max_memory", type=str, default="70GiB",help="The maximum memory of each GPU")
     parser.add_argument("--early_stop", type=int, default=0,help="early stoping after validation loss do not decrease")
     parser.add_argument("--off_load_to_disk", action="store_true", default=False, help="save training dataset to disk, saving CPU memory but may reduce training speed")
+    
+    # LayerWise-QAT arguments
+    parser.add_argument("--layer_ordering", type=str, default="original", 
+                        choices=["original", "sensitivity", "random"],
+                        help="Strategy for ordering layer training: original, sensitivity-based, or random")
+    parser.add_argument("--sensitivity_metric", type=str, default="fisher",
+                        choices=["fisher", "gradient", "hessian"],
+                        help="Sensitivity metric for layer ordering: fisher information, gradient norm, or hessian trace")
+    parser.add_argument("--sensitivity_samples", type=int, default=64,
+                        help="Number of samples for sensitivity computation")
+    parser.add_argument("--adaptive_lr_scaling", action="store_true", default=False,
+                        help="Scale learning rates based on layer sensitivity")
+    parser.add_argument("--debug_sensitivity", action="store_true", default=False,
+                        help="Enable detailed sensitivity analysis logging")
 
     os.environ['TOKENIZERS_PARALLELISM'] = 'false'
     args = parser.parse_args()
